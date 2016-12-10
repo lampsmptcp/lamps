@@ -1,0 +1,1547 @@
+diff --git a/include/net/mptcp.h b/include/net/mptcp.h
+index af4eded..d159d44 100644
+--- a/include/net/mptcp.h
++++ b/include/net/mptcp.h
+@@ -186,7 +186,7 @@ struct mptcp_tcp_sock {
+ 	u8	loc_id;
+ 	u8	rem_id;
+ 
+-#define MPTCP_SCHED_SIZE 4
++#define MPTCP_SCHED_SIZE 64
+ 	u8	mptcp_sched[MPTCP_SCHED_SIZE] __aligned(8);
+ 
+ 	struct sk_buff  *shortcut_ofoqueue; /* Shortcut to the current modified
+@@ -251,7 +251,12 @@ struct mptcp_sched_ops {
+ 						struct sock **subsk,
+ 						unsigned int *limit);
+ 	void			(*init)(struct sock *sk);
+-
++	void			(*release)(struct sock *sk);
++	int				(*advance_window)(struct sock *meta_sk,
++						struct sock *subsk,
++						struct sk_buff *skb);
++	/* call before changing ca_state (optional) */
++	void (*set_state)(struct sock *sk, u8 new_state);
+ 	char			name[MPTCP_SCHED_NAME_MAX];
+ 	struct module		*owner;
+ };
+@@ -283,6 +288,8 @@ struct mptcp_cb {
+ 	u8 cnt_subflows;
+ 	u8 cnt_established;
+ 
++#define MPTCP_SCHED_DATA_SIZE 8
++	u8 mptcp_sched[MPTCP_SCHED_DATA_SIZE] __aligned(8);
+ 	struct mptcp_sched_ops *sched_ops;
+ 
+ 	struct sk_buff_head reinject_queue;
+@@ -896,6 +903,15 @@ void mptcp_init_scheduler(struct mptcp_cb *mpcb);
+ void mptcp_cleanup_scheduler(struct mptcp_cb *mpcb);
+ void mptcp_get_default_scheduler(char *name);
+ int mptcp_set_default_scheduler(const char *name);
++bool mptcp_is_available(struct sock *sk, const struct sk_buff *skb,
++			bool zero_wnd_test);
++int mptcp_dont_reinject_skb(const struct tcp_sock *tp, const struct sk_buff *skb);
++bool mptcp_is_temp_unavailable(struct sock *sk, const struct sk_buff *skb, bool zero_wnd_test);
++bool mptcp_is_def_unavailable(struct sock *sk);
++bool subflow_is_active(const struct tcp_sock *tp);
++bool subflow_is_backup(const struct tcp_sock *tp);
++struct sock *get_available_subflow(struct sock *meta_sk, struct sk_buff *skb,
++				   bool zero_wnd_test);
+ extern struct mptcp_sched_ops mptcp_sched_default;
+ 
+ /* Initializes function-pointers and MPTCP-flags */
+@@ -1330,6 +1346,29 @@ static inline bool mptcp_v6_is_v4_mapped(const struct sock *sk)
+ 	       ipv6_addr_type(&inet6_sk(sk)->saddr) == IPV6_ADDR_MAPPED;
+ }
+ 
++static inline void mptcp_set_ca_state(struct sock *sk, const u8 ca_state)
++{
++	/* lamp */
++	if (mptcp(tcp_sk(sk))) {
++		if (tcp_sk(sk)->mpcb->sched_ops->set_state)
++			tcp_sk(sk)->mpcb->sched_ops->set_state(sk, ca_state);
++	}
++}
++
++static inline int mptcp_advance_window(struct sock *meta_sk, struct sock *subsk, struct sk_buff *skb)
++{
++	/* lamp */
++	if (mptcp(tcp_sk(meta_sk))) {
++		if (tcp_sk(meta_sk)->mpcb->sched_ops->advance_window)
++			return tcp_sk(meta_sk)->mpcb->sched_ops->advance_window(meta_sk, subsk, skb);
++		else
++			return 1;
++	}
++
++	return 1;
++}
++
++
+ /* TCP and MPTCP mpc flag-depending functions */
+ u16 mptcp_select_window(struct sock *sk);
+ void mptcp_init_buffer_space(struct sock *sk);
+@@ -1509,6 +1548,8 @@ static inline void mptcp_disable_static_key(void) {}
+ static inline void mptcp_cookies_reqsk_init(struct request_sock *req,
+ 					    struct mptcp_options_received *mopt,
+ 					    struct sk_buff *skb) {}
++static inline void mptcp_set_ca_state(struct sock *sk, const u8 ca_state) {}
++
+ #endif /* CONFIG_MPTCP */
+ 
+ #endif /* _MPTCP_H */
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index beb5684..b9fc0ff 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -906,6 +906,21 @@ static inline int tcp_skb_mss(const struct sk_buff *skb)
+ 	return skb_shinfo(skb)->gso_size;
+ }
+ 
++
++#ifdef CONFIG_MPTCP
++extern struct static_key mptcp_static_key;
++static inline bool mptcp(const struct tcp_sock *tp)
++{
++	return static_key_false(&mptcp_static_key) && tp->mpc;
++}
++#else
++static inline bool mptcp(const struct tcp_sock *tp)
++{
++	return 0;
++}
++#endif
++
++
+ /* Events passed to congestion control interface */
+ enum tcp_ca_event {
+ 	CA_EVENT_TX_START,	/* first transmit when no packets in flight */
+@@ -1247,18 +1262,6 @@ static inline int tcp_win_from_space(int space)
+ 		space - (space>>sysctl_tcp_adv_win_scale);
+ }
+ 
+-#ifdef CONFIG_MPTCP
+-extern struct static_key mptcp_static_key;
+-static inline bool mptcp(const struct tcp_sock *tp)
+-{
+-	return static_key_false(&mptcp_static_key) && tp->mpc;
+-}
+-#else
+-static inline bool mptcp(const struct tcp_sock *tp)
+-{
+-	return 0;
+-}
+-#endif
+ 
+ /* Note: caller must be prepared to deal with negative returns */ 
+ static inline int tcp_space(const struct sock *sk)
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index c59e784..53d93eb 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -1243,6 +1243,17 @@ int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+ 				copy = max - skb->len;
+ 			}
+ 
++			
++			/*lamp debug*/
++			if (skb)
++			mptcp_debug("%s %u: merge seq:%u,%u copy:%u snd_head:%p\n",
++					__func__, 
++					__LINE__,
++					TCP_SKB_CB(skb)->seq, 
++					TCP_SKB_CB(skb)->end_seq,
++					copy,
++					tcp_send_head(sk));
++
+ 			if (copy <= 0) {
+ new_segment:
+ 				/* Allocate new segment. If the interface is SG,
+@@ -1286,6 +1297,15 @@ new_segment:
+ 			if (copy > seglen)
+ 				copy = seglen;
+ 
++			if (skb)
++			mptcp_debug("%s %u: merge seq:%u,%u copy:%u snd_head:%p\n",
++					__func__,
++					__LINE__,
++					TCP_SKB_CB(skb)->seq, 
++					TCP_SKB_CB(skb)->end_seq,
++					copy,
++					tcp_send_head(sk));
++
+ 			/* Where to copy to? */
+ 			if (skb_availroom(skb) > 0) {
+ 				/* We have some space in skb head. Superb! */
+@@ -1340,6 +1360,7 @@ new_segment:
+ 			TCP_SKB_CB(skb)->end_seq += copy;
+ 			tcp_skb_pcount_set(skb, 0);
+ 
++
+ 			from += copy;
+ 			copied += copy;
+ 			if ((seglen -= copy) == 0 && iovlen == 0) {
+@@ -2344,6 +2365,7 @@ int tcp_disconnect(struct sock *sk, int flags)
+ 	tp->snd_cwnd_cnt = 0;
+ 	tp->window_clamp = 0;
+ 	tcp_set_ca_state(sk, TCP_CA_Open);
++	mptcp_set_ca_state(sk, TCP_CA_Open);
+ 	tcp_clear_retrans(tp);
+ 	inet_csk_delack_init(sk);
+ 	tcp_init_send_head(sk);
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index dbce900..d3af929 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -1983,6 +1983,7 @@ void tcp_enter_loss(struct sock *sk)
+ 		tp->reordering = min_t(unsigned int, tp->reordering,
+ 				       sysctl_tcp_reordering);
+ 	tcp_set_ca_state(sk, TCP_CA_Loss);
++	mptcp_set_ca_state(sk, TCP_CA_Loss);
+ 	tp->high_seq = tp->snd_nxt;
+ 	tcp_ecn_queue_cwr(tp);
+ 
+@@ -2449,6 +2450,7 @@ static bool tcp_try_undo_recovery(struct sock *sk)
+ 		return true;
+ 	}
+ 	tcp_set_ca_state(sk, TCP_CA_Open);
++	mptcp_set_ca_state(sk, TCP_CA_Open);
+ 	return false;
+ }
+ 
+@@ -2480,8 +2482,10 @@ static bool tcp_try_undo_loss(struct sock *sk, bool frto_undo)
+ 			NET_INC_STATS_BH(sock_net(sk),
+ 					 LINUX_MIB_TCPSPURIOUSRTOS);
+ 		inet_csk(sk)->icsk_retransmits = 0;
+-		if (frto_undo || tcp_is_sack(tp))
++		if (frto_undo || tcp_is_sack(tp)) {
+ 			tcp_set_ca_state(sk, TCP_CA_Open);
++			mptcp_set_ca_state(sk, TCP_CA_Open);
++		}
+ 		return true;
+ 	}
+ 	return false;
+@@ -2558,6 +2562,7 @@ void tcp_enter_cwr(struct sock *sk)
+ 		tp->undo_marker = 0;
+ 		tcp_init_cwnd_reduction(sk);
+ 		tcp_set_ca_state(sk, TCP_CA_CWR);
++		mptcp_set_ca_state(sk, TCP_CA_CWR);
+ 	}
+ }
+ 
+@@ -2571,6 +2576,7 @@ static void tcp_try_keep_open(struct sock *sk)
+ 
+ 	if (inet_csk(sk)->icsk_ca_state != state) {
+ 		tcp_set_ca_state(sk, state);
++		mptcp_set_ca_state(sk, state);
+ 		tp->high_seq = tp->snd_nxt;
+ 	}
+ }
+@@ -2667,6 +2673,7 @@ void tcp_simple_retransmit(struct sock *sk)
+ 		tp->prior_ssthresh = 0;
+ 		tp->undo_marker = 0;
+ 		tcp_set_ca_state(sk, TCP_CA_Loss);
++		mptcp_set_ca_state(sk, TCP_CA_Loss);
+ 	}
+ 	tcp_xmit_retransmit_queue(sk);
+ }
+@@ -2693,6 +2700,7 @@ static void tcp_enter_recovery(struct sock *sk, bool ece_ack)
+ 		tcp_init_cwnd_reduction(sk);
+ 	}
+ 	tcp_set_ca_state(sk, TCP_CA_Recovery);
++	mptcp_set_ca_state(sk, TCP_CA_Recovery);
+ }
+ 
+ /* Process an ACK in CA_Loss state. Move to CA_Open if lost data are
+@@ -2827,6 +2835,7 @@ static void tcp_fastretrans_alert(struct sock *sk, const int acked,
+ 			if (tp->snd_una != tp->high_seq) {
+ 				tcp_end_cwnd_reduction(sk);
+ 				tcp_set_ca_state(sk, TCP_CA_Open);
++				mptcp_set_ca_state(sk, TCP_CA_Open);
+ 			}
+ 			break;
+ 
+@@ -3387,6 +3396,7 @@ static void tcp_process_tlp_ack(struct sock *sk, u32 ack, int flag)
+ 		if (!(flag & FLAG_DSACKING_ACK)) {
+ 			tcp_init_cwnd_reduction(sk);
+ 			tcp_set_ca_state(sk, TCP_CA_CWR);
++			mptcp_set_ca_state(sk, TCP_CA_CWR);
+ 			tcp_end_cwnd_reduction(sk);
+ 			tcp_try_keep_open(sk);
+ 			NET_INC_STATS_BH(sock_net(sk),
+diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
+index 5f55c0d..6ce7981 100644
+--- a/net/ipv4/tcp_minisocks.c
++++ b/net/ipv4/tcp_minisocks.c
+@@ -489,6 +489,7 @@ struct sock *tcp_create_openreq_child(struct sock *sk, struct request_sock *req,
+ 			tcp_assign_congestion_control(newsk);
+ 
+ 		tcp_set_ca_state(newsk, TCP_CA_Open);
++		mptcp_set_ca_state(newsk, TCP_CA_Open);
+ 		tcp_init_xmit_timers(newsk);
+ 		__skb_queue_head_init(&newtp->out_of_order_queue);
+ 		newtp->write_seq = newtp->pushed_seq = treq->snt_isn + 1;
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index bd881c3..2c7c281 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -84,6 +84,7 @@ void tcp_event_new_data_sent(struct sock *sk, const struct sk_buff *skb)
+ 	tcp_advance_send_head(sk, skb);
+ 	tp->snd_nxt = TCP_SKB_CB(skb)->end_seq;
+ 
++
+ 	tp->packets_out += tcp_skb_pcount(skb);
+ 	if (!prior_packets || icsk->icsk_pending == ICSK_TIME_EARLY_RETRANS ||
+ 	    icsk->icsk_pending == ICSK_TIME_LOSS_PROBE) {
+diff --git a/net/ipv4/tcp_timer.c b/net/ipv4/tcp_timer.c
+index d60ea4b..781f331 100644
+--- a/net/ipv4/tcp_timer.c
++++ b/net/ipv4/tcp_timer.c
+@@ -441,6 +441,11 @@ void tcp_retransmit_timer(struct sock *sk)
+ 		/* Retransmission failed because of local congestion,
+ 		 * do not backoff.
+ 		 */
++		mptcp_debug("%s %u: rto_times:%u\n",
++							__func__,
++							__LINE__,
++							inet_csk(sk)->icsk_retransmits);
++
+ 		if (!icsk->icsk_retransmits)
+ 			icsk->icsk_retransmits = 1;
+ 		inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
+@@ -466,6 +471,10 @@ void tcp_retransmit_timer(struct sock *sk)
+ 	 */
+ 	icsk->icsk_backoff++;
+ 	icsk->icsk_retransmits++;
++	mptcp_debug("%s %u: rto_times:%u\n",
++						__func__,
++						__LINE__,
++						inet_csk(sk)->icsk_retransmits);
+ 
+ out_reset_timer:
+ 	/* If stream is thin, use linear timeouts. Since 'icsk_backoff' is
+diff --git a/net/mptcp/Kconfig b/net/mptcp/Kconfig
+index cdfc03a..d12db61 100644
+--- a/net/mptcp/Kconfig
++++ b/net/mptcp/Kconfig
+@@ -85,6 +85,19 @@ config MPTCP_ROUNDROBIN
+ 	  This is a very simple round-robin scheduler. Probably has bad performance
+ 	  but might be interesting for researchers.
+ 
++config MPTCP_REDUNDANT
++	tristate "MPTCP Redundant"
++	depends on (MPTCP=y)
++	---help---
++	  This scheduler sends all packets redundantly over all subflows to decreases
++	  latency and jitter on the cost of lower throughput.
++
++config MPTCP_LAMP
++	tristate "MPTCP Lamp"
++	depends on (MPTCP=y)
++	---help---
++	  
++
+ choice
+ 	prompt "Default MPTCP Scheduler"
+ 	default DEFAULT
+@@ -103,6 +116,17 @@ choice
+ 		  This is the round-rob scheduler, sending in a round-robin
+ 		  fashion..
+ 
++	config DEFAULT_REDUNDANT
++		bool "Redundant" if MPTCP_REDUNDANT=y
++		---help---
++		  This is the redundant scheduler, sending packets redundantly over
++		  all the subflows.
++
++	config DEFAULT_LAMP
++		bool "Lamp" if MPTCP_LAMP=y
++		---help---
++
++
+ endchoice
+ endif
+ 
+@@ -111,5 +135,6 @@ config DEFAULT_MPTCP_SCHED
+ 	depends on (MPTCP=y)
+ 	default "default" if DEFAULT_SCHEDULER
+ 	default "roundrobin" if DEFAULT_ROUNDROBIN
++	default "redundant" if DEFAULT_REDUNDANT
+ 	default "default"
+ 
+diff --git a/net/mptcp/Makefile b/net/mptcp/Makefile
+index 5c70e7c..774a90d 100644
+--- a/net/mptcp/Makefile
++++ b/net/mptcp/Makefile
+@@ -16,6 +16,8 @@ obj-$(CONFIG_MPTCP_FULLMESH) += mptcp_fullmesh.o
+ obj-$(CONFIG_MPTCP_NDIFFPORTS) += mptcp_ndiffports.o
+ obj-$(CONFIG_MPTCP_BINDER) += mptcp_binder.o
+ obj-$(CONFIG_MPTCP_ROUNDROBIN) += mptcp_rr.o
++obj-$(CONFIG_MPTCP_REDUNDANT) += mptcp_redundant.o
++obj-$(CONFIG_MPTCP_LAMP) += mptcp_lamp.o
+ 
+ mptcp-$(subst m,y,$(CONFIG_IPV6)) += mptcp_ipv6.o
+ 
+diff --git a/net/mptcp/mptcp_ctrl.c b/net/mptcp/mptcp_ctrl.c
+index 1e1fb53..9880855 100644
+--- a/net/mptcp/mptcp_ctrl.c
++++ b/net/mptcp/mptcp_ctrl.c
+@@ -1317,6 +1317,9 @@ void mptcp_del_sock(struct sock *sk)
+ 	mpcb = tp->mpcb;
+ 	tp_prev = mpcb->connection_list;
+ 
++	if (mpcb->sched_ops->release)
++		mpcb->sched_ops->release(sk);
++
+ 	mptcp_debug("%s: Removing subsock tok %#x pi:%d state %d is_meta? %d\n",
+ 		    __func__, mpcb->mptcp_loc_token, tp->mptcp->path_index,
+ 		    sk->sk_state, is_meta_sk(sk));
+diff --git a/net/mptcp/mptcp_lamp.c b/net/mptcp/mptcp_lamp.c
+new file mode 100644
+index 0000000..5ef8e32
+--- /dev/null
++++ b/net/mptcp/mptcp_lamp.c
+@@ -0,0 +1,661 @@
++
++
++#include <linux/module.h>
++#include <net/mptcp.h>
++
++static unsigned char alpha __read_mostly = 0;
++module_param(alpha, byte, 0644);
++MODULE_PARM_DESC(alpha, "Smoothing parameter");
++
++static unsigned char thresh __read_mostly = 5;
++module_param(thresh, byte, 0644);
++MODULE_PARM_DESC(thresh, "State shift threshold");
++
++
++#define SS_NORMAL 1
++#define SS_REDUNDANT 2
++
++
++struct lamp_priv {
++	u32	last_rbuf_opti;
++	u32 loss1;
++	u32 loss2;
++	u32 loss_rate_inv;
++	u8 lost; /* 0: never lost; 1:lost*/
++	u8 last_state; /* Congestion state */
++	u8 schd_state;
++	/* The skb or NULL */
++	struct sk_buff *skb;
++	/* End sequence number of the skb. This number should be checked
++	 * to be valid before the skb field is used
++	 */
++	u32 skb_end_seq;
++};
++
++static struct lamp_priv *lamp_get_priv(const struct tcp_sock *tp)
++{
++	return (struct lamp_priv *)&tp->mptcp->mptcp_sched[0];
++}
++
++
++static void lamp_init(struct sock *sk)
++{
++	struct lamp_priv *lpp = lamp_get_priv(tcp_sk(sk));
++
++	lpp->last_rbuf_opti = tcp_time_stamp;
++	lpp->schd_state = SS_NORMAL;
++}
++
++
++static struct sk_buff *lamp_mptcp_rcv_buf_optimization(struct sock *sk, int penal)
++{
++	struct sock *meta_sk;
++	const struct tcp_sock *tp = tcp_sk(sk);
++	struct tcp_sock *tp_it;
++	struct sk_buff *skb_head;
++	struct lamp_priv *llp = lamp_get_priv(tp);
++
++	if (tp->mpcb->cnt_subflows == 1)
++		return NULL;
++
++	meta_sk = mptcp_meta_sk(sk);
++	skb_head = tcp_write_queue_head(meta_sk);
++
++	if (!skb_head || skb_head == tcp_send_head(meta_sk))
++		return NULL;
++
++	/* If penalization is optional (coming from mptcp_next_segment() and
++	 * We are not send-buffer-limited we do not penalize. The retransmission
++	 * is just an optimization to fix the idle-time due to the delay before
++	 * we wake up the application.
++	 */
++	if (!penal && sk_stream_memory_free(meta_sk))
++		goto retrans;
++
++	/* Only penalize again after an RTT has elapsed */
++	if (tcp_time_stamp - llp->last_rbuf_opti < usecs_to_jiffies(tp->srtt_us >> 3))
++		goto retrans;
++
++	/* Half the cwnd of the slow flow */
++	mptcp_for_each_tp(tp->mpcb, tp_it) {
++		if (tp_it != tp &&
++		    TCP_SKB_CB(skb_head)->path_mask & mptcp_pi_to_flag(tp_it->mptcp->path_index)) {
++			if (tp->srtt_us < tp_it->srtt_us && inet_csk((struct sock *)tp_it)->icsk_ca_state == TCP_CA_Open) {
++				u32 prior_cwnd = tp_it->snd_cwnd;
++
++				tp_it->snd_cwnd = max(tp_it->snd_cwnd >> 1U, 1U);
++
++				/* If in slow start, do not reduce the ssthresh */
++				if (prior_cwnd >= tp_it->snd_ssthresh)
++					tp_it->snd_ssthresh = max(tp_it->snd_ssthresh >> 1U, 2U);
++
++				llp->last_rbuf_opti = tcp_time_stamp;
++			}
++			break;
++		}
++	}
++
++retrans:
++
++	/* Segment not yet injected into this path? Take it!!! */
++	if (!(TCP_SKB_CB(skb_head)->path_mask & mptcp_pi_to_flag(tp->mptcp->path_index))) {
++		bool do_retrans = false;
++		mptcp_for_each_tp(tp->mpcb, tp_it) {
++			if (tp_it != tp &&
++			    TCP_SKB_CB(skb_head)->path_mask & mptcp_pi_to_flag(tp_it->mptcp->path_index)) {
++				if (tp_it->snd_cwnd <= 4) {
++					do_retrans = true;
++					break;
++				}
++
++				if (4 * tp->srtt_us >= tp_it->srtt_us) {
++					do_retrans = false;
++					break;
++				} else {
++					do_retrans = true;
++				}
++			}
++		}
++
++		if (do_retrans && mptcp_is_available(sk, skb_head, false))
++			return skb_head;
++	}
++	return NULL;
++}
++
++static u32 lamp_get_transfer_time(struct sock *sk)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	struct lamp_priv *lpp = lamp_get_priv(tp);
++	u32 mss_now;
++	u64 trasfer_time;
++	u64 dividend = 0;
++		
++	if (!lpp->lost)
++		return tp->srtt_us >> 1;
++
++	if (tp->snd_una - lpp->loss2 > lpp->loss_rate_inv)
++		mptcp_debug("%s: token:%#x pi:%u lr:%u una:%u l2:%u l1:%u lost:%u\n",
++		    __func__, tp->mpcb->mptcp_loc_token, tp->mptcp->path_index, \
++		    lpp->loss_rate_inv, tp->snd_una, lpp->loss2, lpp->loss1, lpp->lost);
++	lpp->loss_rate_inv = max(tp->snd_una - lpp->loss2, lpp->loss_rate_inv);
++
++	mss_now = tcp_current_mss(sk);
++	if (lpp->loss_rate_inv > mss_now) {
++		dividend = (mss_now + lpp->loss_rate_inv) * (u64)tp->srtt_us;
++		trasfer_time = (dividend /(lpp->loss_rate_inv - mss_now)) >> 1;
++	} else
++		trasfer_time = 0xfffffffd;
++
++	mptcp_debug("%s: token:%#x pi:%u lr:%u mss:%u tt_32:%u tt_64:%llu rtt:%u div:%llu\n",
++				__func__, tp->mpcb->mptcp_loc_token, tp->mptcp->path_index, \
++				lpp->loss_rate_inv, mss_now, (u32)trasfer_time, trasfer_time, tp->srtt_us, dividend);
++		lpp->loss_rate_inv = max(tp->snd_una - lpp->loss2, lpp->loss_rate_inv);
++
++
++	return (u32)trasfer_time;
++
++}
++
++
++static struct sock
++*lamp_get_subflow_from_selectors(struct mptcp_cb *mpcb, struct sk_buff *skb,
++			    bool (*selector)(const struct tcp_sock *),
++			    bool zero_wnd_test, bool *force)
++{
++	struct sock *bestsk = NULL;
++	/*u32 min_srtt = 0xffffffff;*/
++	u32 transfe_time = 0xffffffff;
++	bool found_unused = false;
++	bool found_unused_una = false;
++	struct sock *sk;
++
++	mptcp_for_each_sk(mpcb, sk) {
++		struct tcp_sock *tp = tcp_sk(sk);
++		bool unused = false;
++
++		/* First, we choose only the wanted sks */
++		if (!(*selector)(tp))
++			continue;
++
++		if (!mptcp_dont_reinject_skb(tp, skb))
++			unused = true;
++		else if (found_unused)
++			/* If a unused sk was found previously, we continue -
++			 * no need to check used sks anymore.
++			 */
++			continue;
++
++		if (mptcp_is_def_unavailable(sk))
++			continue;
++
++		if (mptcp_is_temp_unavailable(sk, skb, zero_wnd_test)) {
++			if (unused)
++				found_unused_una = true;
++			continue;
++		}
++
++		if (unused) {
++			if (!found_unused) {
++				/* It's the first time we encounter an unused
++				 * sk - thus we reset the bestsk (which might
++				 * have been set to a used sk).
++				 */
++				transfe_time = 0xffffffff;
++				bestsk = NULL;
++			}
++			found_unused = true;
++		}
++
++		if (lamp_get_transfer_time(sk) < transfe_time) {
++			transfe_time = lamp_get_transfer_time(sk);
++			/*transfe_time = tp->srtt_us;*/
++			bestsk = sk;
++		}
++	}
++
++	if (bestsk) {
++		/* The force variable is used to mark the returned sk as
++		 * previously used or not-used.
++		 */
++		if (found_unused)
++			*force = true;
++		else
++			*force = false;
++	} else {
++		/* The force variable is used to mark if there are temporally
++		 * unavailable not-used sks.
++		 */
++		if (found_unused_una)
++			*force = true;
++		else
++			*force = false;
++	}
++
++	return bestsk;
++}
++
++
++static void lamp_seq_init(struct sock *sk)
++{
++	struct tcp_sock *tp;
++	struct lamp_priv *lpp;
++	if (sk) {
++		lpp = lamp_get_priv(tcp_sk(sk));
++		tp = tcp_sk(sk);
++		if (!lpp->loss1 && !lpp->loss2) {
++			lpp->loss1 = lpp->loss2 = tp->snd_una;
++			lpp->last_state = TCP_CA_Open;
++			mptcp_debug("%s: token:%#x pi:%u una:%u\n",
++				    __func__, tcp_sk(sk)->mpcb->mptcp_loc_token, tcp_sk(sk)->mptcp->path_index, tp->snd_una);
++		}
++	}
++
++}
++
++
++struct sock *lamp_get_available_subflow(struct sock *meta_sk, struct sk_buff *skb,
++				   bool zero_wnd_test)
++{
++	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
++	struct sock *sk;
++	bool force;
++	/*struct lamp_priv *lpp;*/
++
++	/* if there is only one subflow, bypass the scheduling function */
++	if (mpcb->cnt_subflows == 1) {
++		sk = (struct sock *)mpcb->connection_list;
++		if (!mptcp_is_available(sk, skb, zero_wnd_test))
++			sk = NULL;
++		lamp_seq_init(sk);
++		return sk;
++	}
++
++	/* Answer data_fin on same subflow!!! */
++	if (meta_sk->sk_shutdown & RCV_SHUTDOWN &&
++	    skb && mptcp_is_data_fin(skb)) {
++		mptcp_for_each_sk(mpcb, sk) {
++			if (tcp_sk(sk)->mptcp->path_index == mpcb->dfin_path_index &&
++			    mptcp_is_available(sk, skb, zero_wnd_test)) {
++				lamp_seq_init(sk);
++				return sk;
++			}
++		}
++	}
++
++	/* Find the best subflow */
++	sk = lamp_get_subflow_from_selectors(mpcb, skb, &subflow_is_active,
++					zero_wnd_test, &force);
++	if (force) {
++		/* one unused active sk or one NULL sk when there is at least
++		 * one temporally unavailable unused active sk
++		 */
++		lamp_seq_init(sk);
++		return sk;
++	}
++
++	sk = lamp_get_subflow_from_selectors(mpcb, skb, &subflow_is_backup,
++					zero_wnd_test, &force);
++	if (!force && skb)
++		/* one used backup sk or one NULL sk where there is no one
++		 * temporally unavailable unused backup sk
++		 *
++		 * the skb passed through all the available active and backups
++		 * sks, so clean the path mask
++		 */
++		TCP_SKB_CB(skb)->path_mask = 0;
++	
++	lamp_seq_init(sk);
++	return sk;
++}
++
++
++static struct sk_buff *__lamp_next_segment(struct sock *meta_sk, int *reinject)
++{
++	const struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
++	struct sk_buff *skb = NULL;
++
++	*reinject = 0;
++
++	/* If we are in fallback-mode, just take from the meta-send-queue */
++	if (mpcb->infinite_mapping_snd || mpcb->send_infinite_mapping)
++		return tcp_send_head(meta_sk);
++
++	skb = skb_peek(&mpcb->reinject_queue);
++
++	if (skb) {
++		*reinject = 1;
++	} else {
++		skb = tcp_send_head(meta_sk);
++
++		if (!skb && meta_sk->sk_socket &&
++		    test_bit(SOCK_NOSPACE, &meta_sk->sk_socket->flags) &&
++		    sk_stream_wspace(meta_sk) < sk_stream_min_wspace(meta_sk)) {
++			struct sock *subsk = lamp_get_available_subflow(meta_sk, NULL,
++								   false);
++			if (!subsk)
++				return NULL;
++
++			skb = lamp_mptcp_rcv_buf_optimization(subsk, 0);
++			if (skb)
++				*reinject = -1;
++		}
++	}
++	return skb;
++}
++
++static u16 lamp_get_update_subflow_state(struct sock *sk)
++{
++	struct tcp_sock * tp = tcp_sk(sk);
++	struct lamp_priv *lpp = lamp_get_priv(tp);
++	unsigned int mss_now = tcp_current_mss(sk);
++
++	if (lpp->lost && lpp->loss_rate_inv * thresh < 100 * mss_now) {
++		mptcp_debug("%s: %u token:%#x pi:%u lr:%u mss:%u REDUNDANT cwnd:%u\n",
++							__func__,
++				    		__LINE__,
++							tp->mpcb->mptcp_loc_token,
++							tp->mptcp->path_index,
++							lpp->loss_rate_inv,
++							mss_now,
++							tp->snd_cwnd);
++		lpp->schd_state = SS_REDUNDANT;
++		return SS_REDUNDANT;
++	} else {
++		mptcp_debug("%s: %u token:%#x pi:%u lr:%u NORMAL\n",
++						    __func__,
++				    		__LINE__,
++						    tcp_sk(sk)->mpcb->mptcp_loc_token,
++						    tcp_sk(sk)->mptcp->path_index,
++						    lpp->loss_rate_inv);
++		lpp->schd_state = SS_NORMAL;
++		return SS_NORMAL;
++	}
++}
++
++static void lamp_correct_skb_pointers(struct sock *meta_sk,
++					  struct lamp_priv *llp)
++{
++	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
++
++	if (llp->skb && !after(llp->skb_end_seq, meta_tp->snd_una))
++		llp->skb = NULL;
++}
++
++static struct sk_buff *lamp_next_skb_from_queue(struct sk_buff_head *queue,
++						     struct sk_buff *previous, struct lamp_priv *lpp)
++{
++	if (skb_queue_empty(queue))
++		return NULL;
++
++	if (!previous)
++		return skb_peek(queue);
++
++	if (TCP_SKB_CB(previous)->end_seq > lpp->skb_end_seq)
++		return previous;
++
++	if (skb_queue_is_last(queue, previous))
++		return NULL;
++
++	return skb_queue_next(queue, previous);
++}
++
++static bool lamp_all_rddt(struct sock *meta_sk, struct sock *subsk)
++{
++	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
++	struct mptcp_cb *mpcb = meta_tp->mpcb;
++	struct sock *sk;
++	struct lamp_priv *lpp;
++	bool is_all_rddt = true;
++
++	mptcp_for_each_sk(mpcb, sk) {
++		if (subflow_is_active((struct tcp_sock *)sk) && !mptcp_is_def_unavailable(sk)) {
++			lpp = lamp_get_priv(tcp_sk(sk));
++
++			if (lpp->schd_state == SS_NORMAL) {
++				is_all_rddt = false;
++				mptcp_debug("%s: token:%#x pi:%u lr:%u NORMAL\n",
++				    __func__,
++				    tcp_sk(sk)->mpcb->mptcp_loc_token,
++				    tcp_sk(sk)->mptcp->path_index,
++				    lpp->loss_rate_inv);
++				break;
++			}
++		}
++	}
++
++	return is_all_rddt;
++}
++
++
++static struct sk_buff *lamp_next_segment(struct sock *meta_sk,
++					  int *reinject,
++					  struct sock **subsk,
++					  unsigned int *limit)
++{
++	struct sk_buff *skb = __lamp_next_segment(meta_sk, reinject);
++	unsigned int mss_now;
++	struct tcp_sock *subtp;
++	u16 gso_max_segs, subflow_state;
++	u32 max_len, max_segs, window, needed;
++	struct lamp_priv *lpp;
++
++	/* As we set it, we have to reset it as well. */
++	*limit = 0;
++
++	/*if (!skb)
++		return NULL;*/
++
++	*subsk = lamp_get_available_subflow(meta_sk, skb, false);
++	if (!*subsk)
++		return NULL;
++
++	subflow_state = lamp_get_update_subflow_state(*subsk);
++
++	if (subflow_state == SS_NORMAL && !skb)
++		return NULL;
++
++	subtp = tcp_sk(*subsk);
++	mss_now = tcp_current_mss(*subsk);
++	lpp = lamp_get_priv(subtp);
++	
++	mptcp_debug("%s: %u token:%#x pi:%u skb:%p reinject:%d\n",
++				__func__,
++				__LINE__,
++				tcp_sk(*subsk)->mpcb->mptcp_loc_token,
++				tcp_sk(*subsk)->mptcp->path_index,
++				skb,
++				*reinject);
++
++	if (skb && !*reinject && unlikely(!tcp_snd_wnd_test(tcp_sk(meta_sk), skb, mss_now))) {
++		skb = lamp_mptcp_rcv_buf_optimization(*subsk, 1);
++		if (skb)
++			*reinject = -1;
++		else
++			return NULL;
++	} else if (subflow_state == SS_REDUNDANT && *reinject != 1) {
++		lamp_correct_skb_pointers(meta_sk, lpp);
++
++		skb = lamp_next_skb_from_queue(&meta_sk->sk_write_queue,
++						    lpp->skb, lpp);
++		mptcp_debug("%s: %u token:%#x pi:%u lr:%u skb:%p snd_nxt:%u\n",
++				    __func__,
++				    __LINE__,
++				    tcp_sk(*subsk)->mpcb->mptcp_loc_token,
++				    tcp_sk(*subsk)->mptcp->path_index,
++				    lpp->loss_rate_inv,
++				   	skb,
++				    tcp_sk(meta_sk)->snd_nxt);
++		if (!skb)
++			return NULL;
++		
++		if (TCP_SKB_CB(skb)->end_seq > tcp_sk(meta_sk)->snd_nxt && !lamp_all_rddt(meta_sk, *subsk)) {
++			mptcp_debug("%s: %u token:%#x pi:%u lr:%u return NULL new_data!\n",
++						__func__,
++				    	__LINE__,
++						tcp_sk(*subsk)->mpcb->mptcp_loc_token,
++						tcp_sk(*subsk)->mptcp->path_index,
++				    	lpp->loss_rate_inv);
++		}
++	}
++
++	mptcp_debug("%s: %u token:%#x pi:%u reinject:%d skb:%p\n",
++				__func__,
++				__LINE__,
++				tcp_sk(*subsk)->mpcb->mptcp_loc_token,
++				tcp_sk(*subsk)->mptcp->path_index,
++				*reinject,
++				skb);
++
++	if (!*reinject) {
++		lpp->skb = skb;
++		lpp->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
++		mptcp_debug("%s: %u token:%#x pi:%u lr:%u skb:%p skb_end:%u\n",
++				    __func__,
++				    __LINE__,
++				    tcp_sk(*subsk)->mpcb->mptcp_loc_token,
++				    tcp_sk(*subsk)->mptcp->path_index,
++				    lpp->loss_rate_inv,
++				    lpp->skb,
++				    lpp->skb_end_seq);
++	}
++	
++
++
++	/* No splitting required, as we will only send one single segment */
++	if (skb->len <= mss_now)
++		return skb;
++
++	/* The following is similar to tcp_mss_split_point, but
++	 * we do not care about nagle, because we will anyways
++	 * use TCP_NAGLE_PUSH, which overrides this.
++	 *
++	 * So, we first limit according to the cwnd/gso-size and then according
++	 * to the subflow's window.
++	 */
++
++	gso_max_segs = (*subsk)->sk_gso_max_segs;
++	if (!gso_max_segs) /* No gso supported on the subflow's NIC */
++		gso_max_segs = 1;
++	max_segs = min_t(unsigned int, tcp_cwnd_test(subtp, skb), gso_max_segs);
++	if (!max_segs)
++		return NULL;
++
++	max_len = mss_now * max_segs;
++	window = tcp_wnd_end(subtp) - subtp->write_seq;
++
++	needed = min(skb->len, window);
++	if (max_len <= skb->len)
++		/* Take max_win, which is actually the cwnd/gso-size */
++		*limit = max_len;
++	else
++		/* Or, take the window */
++		*limit = needed;
++
++	return skb;
++}
++
++static void lamp_set_state(struct sock *sk, u8 new_state) 
++{
++	if (new_state == TCP_CA_Loss || new_state == TCP_CA_Recovery || new_state == TCP_CA_CWR) {
++		struct tcp_sock *tp = tcp_sk(sk);
++		struct lamp_priv *lpp = lamp_get_priv(tp);
++
++		mptcp_debug("%s: token:%#x pi:%u rto_times:%u rto:%u\n",
++							__func__,
++							tp->mpcb->mptcp_loc_token,
++							tp->mptcp->path_index,
++							inet_csk(sk)->icsk_retransmits,
++							jiffies_to_msecs(inet_csk(sk)->icsk_rto));
++		if (!inet_csk(sk)->icsk_retransmits) {
++			u32 sample = 0;
++
++			if (lpp->last_state == TCP_CA_Recovery && new_state == TCP_CA_Loss && \
++				lpp->loss2 == tp->snd_una) {
++				mptcp_debug("%s: token:%#x pi:%u recover to loss\n",
++				    __func__, tp->mpcb->mptcp_loc_token, tp->mptcp->path_index);
++				return;
++			}
++
++			if (lpp->last_state == TCP_CA_Loss && new_state == TCP_CA_Recovery && \
++				lpp->loss2 == tp->snd_una) {
++				mptcp_debug("%s: token:%#x pi:%u loss may undo\n",
++				    __func__, tp->mpcb->mptcp_loc_token, tp->mptcp->path_index);
++				return;
++			}
++
++			lpp->loss1 = lpp->loss2;
++			lpp->loss2 = tp->snd_una;
++			sample = lpp->loss2 - lpp->loss1 + tcp_current_mss(sk);
++
++			if (lpp->lost)
++				lpp->loss_rate_inv = (sample >> alpha) + lpp->loss_rate_inv \
++								- (lpp->loss_rate_inv >> alpha);
++			else {
++				lpp->loss_rate_inv = sample << 2; /* Initial of loss rate */
++			}
++			
++			lpp->lost = 1;
++			mptcp_debug("%s: token:%#x pi:%u lr:%u sample:%u l1:%u l2:%u nstate:%u lost:%u\n",
++				__func__, tp->mpcb->mptcp_loc_token, tp->mptcp->path_index, lpp->loss_rate_inv, \
++				sample, lpp->loss1, lpp->loss2, new_state, lpp->lost);
++
++			lpp->last_state = new_state;			
++		}
++	}
++}
++
++static int lamp_advance_window(struct sock *meta_sk, struct sock *subsk, struct sk_buff *skb)
++{
++	struct lamp_priv *sub_lpp = lamp_get_priv(tcp_sk(subsk));
++	
++	if (sub_lpp->schd_state == SS_NORMAL)
++		return 1;
++	else if (lamp_all_rddt(meta_sk, subsk) && (TCP_SKB_CB(skb)->end_seq > tcp_sk(meta_sk)->snd_nxt)) {
++		mptcp_debug("%s: %u token:%#x pi:%u end_seq:%u nxt:%u Advance!\n",
++				__func__,
++				__LINE__,
++				tcp_sk(subsk)->mpcb->mptcp_loc_token,
++				tcp_sk(subsk)->mptcp->path_index,
++				TCP_SKB_CB(skb)->end_seq,
++				tcp_sk(meta_sk)->snd_nxt);
++		return 1;
++	}
++	
++	return 0;
++}
++
++
++static struct mptcp_sched_ops mptcp_sched_lamp = {
++	.get_subflow = lamp_get_available_subflow,
++	.next_segment = lamp_next_segment,
++	.set_state = lamp_set_state,
++	.advance_window = lamp_advance_window,
++	.init = lamp_init,
++	.name = "lamp",
++	.owner = THIS_MODULE,
++};
++
++static int __init lamp_register(void)
++{
++	BUILD_BUG_ON(sizeof(struct lamp_priv) > MPTCP_SCHED_SIZE);
++
++	if (mptcp_register_scheduler(&mptcp_sched_lamp))
++		return -1;
++
++	return 0;
++}
++
++static void lamp_unregister(void)
++{
++	mptcp_unregister_scheduler(&mptcp_sched_lamp);
++}
++
++module_init(lamp_register);
++module_exit(lamp_unregister);
++
++MODULE_AUTHOR("");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("MPTCP LAMP");
++MODULE_VERSION("0.89");
++
+diff --git a/net/mptcp/mptcp_output.c b/net/mptcp/mptcp_output.c
+index 2b462eb..8c3e7c1 100644
+--- a/net/mptcp/mptcp_output.c
++++ b/net/mptcp/mptcp_output.c
+@@ -663,6 +663,16 @@ bool mptcp_write_xmit(struct sock *meta_sk, unsigned int mss_now, int nonagle,
+ 
+ 		subtp = tcp_sk(subsk);
+ 		mss_now = tcp_current_mss(subsk);
++		
++		mptcp_debug("%s: %u token:%#x pi:%u seq:%u end_seq:%u nxt:%u %u\n",
++						__func__,
++						__LINE__,
++						tcp_sk(subsk)->mpcb->mptcp_loc_token,
++						tcp_sk(subsk)->mptcp->path_index,
++						TCP_SKB_CB(skb)->seq,
++						TCP_SKB_CB(skb)->end_seq,
++						tcp_sk(meta_sk)->snd_nxt,
++						reinject);
+ 
+ 		if (reinject == 1) {
+ 			if (!after(TCP_SKB_CB(skb)->end_seq, meta_tp->snd_una)) {
+@@ -672,17 +682,17 @@ bool mptcp_write_xmit(struct sock *meta_sk, unsigned int mss_now, int nonagle,
+ 				continue;
+ 			}
+ 		}
+-
++		
+ 		/* If the segment was cloned (e.g. a meta retransmission),
+ 		 * the header must be expanded/copied so that there is no
+ 		 * corruption of TSO information.
+ 		 */
+ 		if (skb_unclone(skb, GFP_ATOMIC))
+ 			break;
+-
++		
+ 		if (unlikely(!tcp_snd_wnd_test(meta_tp, skb, mss_now)))
+ 			break;
+-
++		
+ 		/* Force tso_segs to 1 by using UINT_MAX.
+ 		 * We actually don't care about the exact number of segments
+ 		 * emitted on the subflow. We need just to set tso_segs, because
+@@ -699,6 +709,7 @@ bool mptcp_write_xmit(struct sock *meta_sk, unsigned int mss_now, int nonagle,
+ 		 * subject to the MPTCP-level. It is based on the properties of
+ 		 * the subflow, not the MPTCP-level.
+ 		 */
++
+ 		if (unlikely(!tcp_nagle_test(meta_tp, skb, mss_now,
+ 					     (tcp_skb_is_last(meta_sk, skb) ?
+ 					      nonagle : TCP_NAGLE_PUSH))))
+@@ -722,7 +733,6 @@ bool mptcp_write_xmit(struct sock *meta_sk, unsigned int mss_now, int nonagle,
+ 			limit = tcp_mss_split_point(meta_sk, skb, mss_now,
+ 						    UINT_MAX / mss_now,
+ 						    nonagle);
+-
+ 		if (sublimit)
+ 			limit = min(limit, sublimit);
+ 
+@@ -735,11 +745,21 @@ bool mptcp_write_xmit(struct sock *meta_sk, unsigned int mss_now, int nonagle,
+ 		/* Nagle is handled at the MPTCP-layer, so
+ 		 * always push on the subflow
+ 		 */
++		 
+ 		__tcp_push_pending_frames(subsk, mss_now, TCP_NAGLE_PUSH);
+ 		path_mask |= mptcp_pi_to_flag(subtp->mptcp->path_index);
+ 		skb_mstamp_get(&skb->skb_mstamp);
+-
+-		if (!reinject) {
++		
++		mptcp_debug("%s: %u token:%#x pi:%u seq:%u end_seq:%u nxt:%u!\n",
++						__func__,
++						__LINE__,
++						tcp_sk(subsk)->mpcb->mptcp_loc_token,
++						tcp_sk(subsk)->mptcp->path_index,
++						TCP_SKB_CB(skb)->seq,
++						TCP_SKB_CB(skb)->end_seq,
++						tcp_sk(meta_sk)->snd_nxt);
++
++		if (!reinject && mptcp_advance_window(meta_sk, subsk, skb)) {
+ 			mptcp_check_sndseq_wrap(meta_tp,
+ 						TCP_SKB_CB(skb)->end_seq -
+ 						TCP_SKB_CB(skb)->seq);
+@@ -1390,6 +1410,14 @@ int mptcp_retransmit_skb(struct sock *meta_sk, struct sk_buff *skb)
+ 		err = -ENOMEM;
+ 		goto failed;
+ 	}
++	mptcp_debug("%s: %u token:%#x pi:%u seq:%u end_seq:%u nxt:%u\n",
++				__func__,
++				__LINE__,
++				tcp_sk(subsk)->mpcb->mptcp_loc_token,
++				tcp_sk(subsk)->mptcp->path_index,
++				TCP_SKB_CB(skb)->seq,
++				TCP_SKB_CB(skb)->end_seq,
++				tcp_sk(meta_sk)->snd_nxt);
+ 
+ 	/* Must have been set by mptcp_write_xmit before */
+ 	BUG_ON(!tcp_skb_pcount(skb));
+@@ -1476,6 +1504,13 @@ void mptcp_retransmit_timer(struct sock *meta_sk)
+ 			tcp_write_err(meta_sk);
+ 			return;
+ 		}
++		mptcp_debug("%s: %u token:%#x seq:%u end_seq:%u nxt:%u\n",
++							__func__,
++							__LINE__,
++							tcp_sk(meta_sk)->mpcb->mptcp_loc_token,
++							TCP_SKB_CB(tcp_write_queue_head(meta_sk))->seq,
++							TCP_SKB_CB(tcp_write_queue_head(meta_sk))->end_seq,
++							tcp_sk(meta_sk)->snd_nxt);
+ 
+ 		mptcp_retransmit_skb(meta_sk, tcp_write_queue_head(meta_sk));
+ 		goto out_reset_timer;
+@@ -1488,6 +1523,13 @@ void mptcp_retransmit_timer(struct sock *meta_sk)
+ 		NET_INC_STATS_BH(sock_net(meta_sk), LINUX_MIB_TCPTIMEOUTS);
+ 
+ 	meta_icsk->icsk_ca_state = TCP_CA_Loss;
++	mptcp_debug("%s: %u token:%#x seq:%u end_seq:%u nxt:%u\n",
++					__func__,
++					__LINE__,
++					tcp_sk(meta_sk)->mpcb->mptcp_loc_token,
++					TCP_SKB_CB(tcp_write_queue_head(meta_sk))->seq,
++					TCP_SKB_CB(tcp_write_queue_head(meta_sk))->end_seq,
++					tcp_sk(meta_sk)->snd_nxt);
+ 
+ 	err = mptcp_retransmit_skb(meta_sk, tcp_write_queue_head(meta_sk));
+ 	if (err > 0) {
+diff --git a/net/mptcp/mptcp_redundant.c b/net/mptcp/mptcp_redundant.c
+new file mode 100644
+index 0000000..b5de923
+--- /dev/null
++++ b/net/mptcp/mptcp_redundant.c
+@@ -0,0 +1,279 @@
++/*
++ *	MPTCP Scheduler to reduce latency and jitter.
++ *
++ *	This scheduler sends all packets redundantly on all available subflows.
++ *
++ *	Initial Design & Implementation:
++ *	Tobias Erbshaeusser <erbshauesser@dvs.tu-darmstadt.de>
++ *	Alexander Froemmgen <froemmge@dvs.tu-darmstadt.de>
++ *
++ *	Initial corrections & modifications:
++ *	Christian Pinedo <christian.pinedo@ehu.eus>
++ *	Igor Lopez <igor.lopez@ehu.eus>
++ *
++ *	This program is free software; you can redistribute it and/or
++ *      modify it under the terms of the GNU General Public License
++ *      as published by the Free Software Foundation; either version
++ *      2 of the License, or (at your option) any later version.
++ */
++
++#include <linux/module.h>
++#include <net/mptcp.h>
++
++/* Struct to store the data of a single subflow */
++struct redsched_sock_data {
++	/* The skb or NULL */
++	struct sk_buff *skb;
++	/* End sequence number of the skb. This number should be checked
++	 * to be valid before the skb field is used
++	 */
++	u32 skb_end_seq;
++};
++
++/* Struct to store the data of the control block */
++struct redsched_cb_data {
++	/* The next subflow where a skb should be sent or NULL */
++	struct tcp_sock *next_subflow;
++};
++
++/* Returns the socket data from a given subflow socket */
++static struct redsched_sock_data *redsched_get_sock_data(struct tcp_sock *tp)
++{
++	return (struct redsched_sock_data *)&tp->mptcp->mptcp_sched[0];
++}
++
++/* Returns the control block data from a given meta socket */
++static struct redsched_cb_data *redsched_get_cb_data(struct tcp_sock *tp)
++{
++	return (struct redsched_cb_data *)&tp->mpcb->mptcp_sched[0];
++}
++
++static bool redsched_get_active_valid_sks(struct sock *meta_sk)
++{
++	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
++	struct mptcp_cb *mpcb = meta_tp->mpcb;
++	struct sock *sk;
++	int active_valid_sks = 0;
++
++	mptcp_for_each_sk(mpcb, sk) {
++		if (subflow_is_active((struct tcp_sock *)sk) &&
++		    !mptcp_is_def_unavailable(sk))
++			active_valid_sks++;
++	}
++
++	return active_valid_sks;
++}
++
++static bool redsched_use_subflow(struct sock *meta_sk,
++				 int active_valid_sks,
++				 struct tcp_sock *tp,
++				 struct sk_buff *skb)
++{
++	if (!skb || !mptcp_is_available((struct sock *)tp, skb, false))
++		return false;
++
++	if (TCP_SKB_CB(skb)->path_mask != 0)
++		return subflow_is_active(tp);
++
++	if (TCP_SKB_CB(skb)->path_mask == 0) {
++		if (active_valid_sks == -1)
++			active_valid_sks =
++				redsched_get_active_valid_sks(meta_sk);
++		if (subflow_is_backup(tp) && active_valid_sks > 0)
++			return false;
++		else
++			return true;
++	}
++
++	return false;
++}
++
++static struct sock *redundant_get_subflow(struct sock *meta_sk,
++					  struct sk_buff *skb,
++					  bool zero_wnd_test)
++{
++	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
++	struct mptcp_cb *mpcb = meta_tp->mpcb;
++	struct redsched_cb_data *cb_data = redsched_get_cb_data(meta_tp);
++	struct tcp_sock *first_tp = cb_data->next_subflow;
++	struct sock *sk;
++	struct tcp_sock *tp;
++
++	/* Answer data_fin on same subflow */
++	if (meta_sk->sk_shutdown & RCV_SHUTDOWN &&
++	    skb && mptcp_is_data_fin(skb)) {
++		mptcp_for_each_sk(mpcb, sk) {
++			if (tcp_sk(sk)->mptcp->path_index ==
++				mpcb->dfin_path_index &&
++			    mptcp_is_available(sk, skb, zero_wnd_test))
++				return sk;
++		}
++	}
++
++	if (!first_tp)
++		first_tp = mpcb->connection_list;
++	tp = first_tp;
++
++
++	if (!tp)
++		return NULL;
++	/* Search for any subflow to send it */
++	do {
++		if (mptcp_is_available((struct sock *)tp, skb,
++				       zero_wnd_test)) {
++			cb_data->next_subflow = tp->mptcp->next;
++			return (struct sock *)tp;
++		}
++
++		tp = tp->mptcp->next;
++		if (!tp)
++			tp = mpcb->connection_list;
++	} while (tp != first_tp);
++
++	/* No space */
++	return NULL;
++}
++
++/* Corrects the stored skb pointers if they are invalid */
++static void redsched_correct_skb_pointers(struct sock *meta_sk,
++					  struct redsched_sock_data *sk_data)
++{
++	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
++
++	if (sk_data->skb && !after(sk_data->skb_end_seq,
++				   meta_tp->snd_una))
++		sk_data->skb = NULL;
++}
++
++/* Returns the next skb from the queue */
++static struct sk_buff *redundant_next_skb_from_queue(struct sk_buff_head *queue,
++						     struct sk_buff *previous, struct redsched_sock_data *sk_data)
++{
++	if (skb_queue_empty(queue))
++		return NULL;
++
++	if (!previous)
++		return skb_peek(queue);
++	
++	if (TCP_SKB_CB(previous)->end_seq > sk_data->skb_end_seq)
++		return previous;
++
++	if (skb_queue_is_last(queue, previous))
++		return NULL;
++
++	return skb_queue_next(queue, previous);
++}
++
++static struct sk_buff *redundant_next_segment(struct sock *meta_sk,
++					      int *reinject,
++					      struct sock **subsk,
++					      unsigned int *limit)
++{
++	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
++	struct mptcp_cb *mpcb = meta_tp->mpcb;
++	struct redsched_cb_data *cb_data = redsched_get_cb_data(meta_tp);
++	struct tcp_sock *first_tp = cb_data->next_subflow;
++	struct tcp_sock *tp;
++	struct redsched_sock_data *sk_data;
++	struct sk_buff *skb;
++	int active_valid_sks = -1;
++
++	if (!first_tp)
++		first_tp = mpcb->connection_list;
++	tp = first_tp;
++
++	if (skb_queue_empty(&mpcb->reinject_queue) &&
++	    skb_queue_empty(&meta_sk->sk_write_queue))
++		/* Nothing to send */
++		return NULL;
++
++	/* First try reinjections */
++	skb = skb_peek(&mpcb->reinject_queue);
++	if (skb) {
++		*subsk = get_available_subflow(meta_sk, skb, false);
++		if (!*subsk)
++			return NULL;
++		*reinject = 1;
++		return skb;
++	}
++
++	/* Then try indistinctly redundant and normal skbs */
++	*reinject = 0;
++	active_valid_sks = redsched_get_active_valid_sks(meta_sk);
++	do {		
++		/* Correct the skb pointers of the current subflow */
++		sk_data = redsched_get_sock_data(tp);
++
++		redsched_correct_skb_pointers(meta_sk, sk_data);
++
++		skb = redundant_next_skb_from_queue(&meta_sk->sk_write_queue,
++						    sk_data->skb, sk_data);
++			
++		if (skb && redsched_use_subflow(meta_sk, active_valid_sks, tp,
++						skb)) {
++			sk_data->skb = skb;
++			sk_data->skb_end_seq =
++					TCP_SKB_CB(skb)->end_seq;
++			cb_data->next_subflow = tp->mptcp->next;
++			*subsk = (struct sock *)tp;
++			return skb;
++		}
++
++		tp = tp->mptcp->next;
++		if (!tp)
++			tp = mpcb->connection_list;
++	} while (tp != first_tp);
++
++	/* Nothing to send */
++	return NULL;
++}
++
++static void redundant_release(struct sock *sk)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	struct redsched_cb_data *cb_data = redsched_get_cb_data(tp);
++
++	/* Check if the next subflow would be the released one. If yes correct
++	 * the pointer
++	 */
++	if (cb_data->next_subflow == tp)
++		cb_data->next_subflow = tp->mptcp->next;
++}
++
++static int redundant_advance_window(struct sock *meta_sk, struct sock *subsk, struct sk_buff *skb)
++{
++	return TCP_SKB_CB(skb)->end_seq > tcp_sk(meta_sk)->snd_nxt;
++}
++
++struct mptcp_sched_ops mptcp_sched_redundant = {
++	.get_subflow = redundant_get_subflow,
++	.next_segment = redundant_next_segment,
++	.release = redundant_release,
++	.advance_window = redundant_advance_window,
++	.name = "redundant",
++	.owner = THIS_MODULE,
++};
++
++static int __init redundant_register(void)
++{
++	BUILD_BUG_ON(sizeof(struct redsched_sock_data) > MPTCP_SCHED_SIZE);
++	BUILD_BUG_ON(sizeof(struct redsched_cb_data) > MPTCP_SCHED_DATA_SIZE);
++
++	if (mptcp_register_scheduler(&mptcp_sched_redundant))
++		return -1;
++
++	return 0;
++}
++
++static void redundant_unregister(void)
++{
++	mptcp_unregister_scheduler(&mptcp_sched_redundant);
++}
++
++module_init(redundant_register);
++module_exit(redundant_unregister);
++
++MODULE_AUTHOR("Tobias Erbshaeusser, Alexander Froemmgen");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("REDUNDANT MPTCP");
++MODULE_VERSION("0.90");
+diff --git a/net/mptcp/mptcp_sched.c b/net/mptcp/mptcp_sched.c
+index c18bded..07c8931 100644
+--- a/net/mptcp/mptcp_sched.c
++++ b/net/mptcp/mptcp_sched.c
+@@ -15,7 +15,7 @@ static struct defsched_priv *defsched_get_priv(const struct tcp_sock *tp)
+ 	return (struct defsched_priv *)&tp->mptcp->mptcp_sched[0];
+ }
+ 
+-static bool mptcp_is_def_unavailable(struct sock *sk)
++bool mptcp_is_def_unavailable(struct sock *sk)
+ {
+ 	const struct tcp_sock *tp = tcp_sk(sk);
+ 
+@@ -35,7 +35,7 @@ static bool mptcp_is_def_unavailable(struct sock *sk)
+ 	return false;
+ }
+ 
+-static bool mptcp_is_temp_unavailable(struct sock *sk,
++bool mptcp_is_temp_unavailable(struct sock *sk,
+ 				      const struct sk_buff *skb,
+ 				      bool zero_wnd_test)
+ {
+@@ -101,15 +101,18 @@ static bool mptcp_is_temp_unavailable(struct sock *sk,
+ }
+ 
+ /* Is the sub-socket sk available to send the skb? */
+-static bool mptcp_is_available(struct sock *sk, const struct sk_buff *skb,
+-			       bool zero_wnd_test)
++bool mptcp_is_available(struct sock *sk, const struct sk_buff *skb,
++			bool zero_wnd_test)
+ {
+-	return !mptcp_is_def_unavailable(sk) &&
+-	       !mptcp_is_temp_unavailable(sk, skb, zero_wnd_test);
++	if (sk)
++		return !mptcp_is_def_unavailable(sk) &&
++		       !mptcp_is_temp_unavailable(sk, skb, zero_wnd_test);
++	else
++		return false;
+ }
+ 
+ /* Are we not allowed to reinject this skb on tp? */
+-static int mptcp_dont_reinject_skb(const struct tcp_sock *tp, const struct sk_buff *skb)
++int mptcp_dont_reinject_skb(const struct tcp_sock *tp, const struct sk_buff *skb)
+ {
+ 	/* If the skb has already been enqueued in this sk, try to find
+ 	 * another one.
+@@ -119,12 +122,12 @@ static int mptcp_dont_reinject_skb(const struct tcp_sock *tp, const struct sk_bu
+ 		mptcp_pi_to_flag(tp->mptcp->path_index) & TCP_SKB_CB(skb)->path_mask;
+ }
+ 
+-static bool subflow_is_backup(const struct tcp_sock *tp)
++bool subflow_is_backup(const struct tcp_sock *tp)
+ {
+ 	return tp->mptcp->rcv_low_prio || tp->mptcp->low_prio;
+ }
+ 
+-static bool subflow_is_active(const struct tcp_sock *tp)
++bool subflow_is_active(const struct tcp_sock *tp)
+ {
+ 	return !tp->mptcp->rcv_low_prio && !tp->mptcp->low_prio;
+ }
+@@ -214,9 +217,8 @@ static struct sock
+  *
+  * Additionally, this function is aware of the backup-subflows.
+  */
+-static struct sock *get_available_subflow(struct sock *meta_sk,
+-					  struct sk_buff *skb,
+-					  bool zero_wnd_test)
++struct sock *get_available_subflow(struct sock *meta_sk, struct sk_buff *skb,
++				   bool zero_wnd_test)
+ {
+ 	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
+ 	struct sock *sk;
